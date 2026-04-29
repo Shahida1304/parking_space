@@ -1,150 +1,74 @@
-from flask import Flask, render_template, request, jsonify
+import streamlit as st
 from ultralytics import YOLO
-import os
-import time
-import threading
 import cv2
+import numpy as np
+from PIL import Image
+import os
 
-app = Flask(__name__)
+# =========================
+# LOAD MODEL (once)
+# =========================
+@st.cache_resource
+def load_model():
+    return YOLO("best1.pt")
 
-# ===============================
-# FOLDERS
-# ===============================
-UPLOAD_FOLDER = "uploads"
-STATIC_FOLDER = "static"
+model = load_model()
 
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-os.makedirs(STATIC_FOLDER, exist_ok=True)
+# =========================
+# PROCESS IMAGE
+# =========================
+def process_image(image):
+    img = np.array(image)
 
-# ===============================
-# LOAD MODEL (only once)
-# ===============================
-model = YOLO("best1.pt")
+    results = model.predict(source=img, conf=0.4, save=False)
 
-# detection results storage
-detection_stats = {"free": 0, "occupied": 0, "total": 0}
+    free = 0
+    occupied = 0
 
+    boxes = results[0].boxes.xyxy.cpu().numpy()
+    classes = results[0].boxes.cls.cpu().numpy()
 
-# ===============================
-# GET LATEST IMAGE FROM FOLDER
-# ===============================
-def get_latest_image():
-    files = [
-        os.path.join(UPLOAD_FOLDER, f)
-        for f in os.listdir(UPLOAD_FOLDER)
-        if f.lower().endswith((".jpg", ".jpeg", ".png"))
-    ]
+    for box, cls in zip(boxes, classes):
+        x1, y1, x2, y2 = map(int, box)
 
-    if not files:
-        return None
+        if int(cls) == 0:
+            color = (0, 255, 0)
+            free += 1
+        else:
+            color = (0, 0, 255)
+            occupied += 1
 
-    # newest file by modification time
-    latest_file = max(files, key=os.path.getmtime)
-    return latest_file
+        cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
 
+    total = free + occupied
 
-# ===============================
-# PROCESS IMAGE (MAIN DETECTION)
-# ===============================
-def process_image(image_path):
-    global detection_stats
-
-    try:
-        print(f"[PROCESSING] {image_path}")
-
-        results = model.predict(source=image_path, conf=0.4, save=False)
-
-        # read original image
-        img = cv2.imread(image_path)
-
-        free = 0
-        occupied = 0
-
-        boxes = results[0].boxes.xyxy.cpu().numpy()
-        classes = results[0].boxes.cls.cpu().numpy()
-
-        for box, cls in zip(boxes, classes):
-            x1, y1, x2, y2 = map(int, box)
-
-            # CLASS 0 = EMPTY → GREEN
-            if int(cls) == 0:
-                color = (0, 255, 0)
-                free += 1
-            else:
-                color = (0, 0, 255)
-                occupied += 1
-
-            # draw ONLY rectangle
-            cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
-
-        total = free + occupied
-
-        detection_stats = {
-            "free": free,
-            "occupied": occupied,
-            "total": total,
-        }
-
-        # save output image
-        output_path = os.path.join(STATIC_FOLDER, "output.jpg")
-        cv2.imwrite(output_path, img)
-
-        print(f"[DONE] Free={free} Occupied={occupied} Total={total}")
-
-    except Exception as e:
-        print("Processing Error:", e)
+    return img, free, occupied, total
 
 
-# ===============================
-# AUTO DETECTION THREAD
-# ===============================
-def auto_detect():
-    last_processed = None
+# =========================
+# UI
+# =========================
+st.set_page_config(page_title="Smart Parking", layout="wide")
 
-    while True:
-        latest = get_latest_image()
+st.title("🚗 Smart Parking Slot Detection")
 
-        if latest and latest != last_processed:
-            process_image(latest)
-            last_processed = latest
+uploaded_file = st.file_uploader("Upload Parking Image", type=["jpg", "jpeg", "png"])
 
-        time.sleep(120)  # every 2 minutes
+if uploaded_file:
+    image = Image.open(uploaded_file)
 
+    st.subheader("Original Image")
+    st.image(image, use_container_width=True)
 
-threading.Thread(target=auto_detect, daemon=True).start()
+    with st.spinner("Detecting..."):
+        output_img, free, occupied, total = process_image(image)
 
+    st.subheader("Detection Result")
+    st.image(output_img, channels="BGR", use_container_width=True)
 
-# ===============================
-# MAIN PAGE
-# ===============================
-@app.route("/", methods=["GET", "POST"])
-def index():
-    if request.method == "POST":
-        file = request.files.get("image")
+    # Stats
+    col1, col2, col3 = st.columns(3)
 
-        if file:
-            filepath = os.path.join(UPLOAD_FOLDER, file.filename)
-            file.save(filepath)
-
-            # immediate detection after upload
-            process_image(filepath)
-
-    return render_template(
-        "index.html",
-        free=detection_stats["free"],
-        occupied=detection_stats["occupied"],
-        total=detection_stats["total"],
-    )
-
-
-# ===============================
-# LIVE STATS API
-# ===============================
-@app.route("/stats")
-def stats():
-    return jsonify(detection_stats)
-
-
-# ===============================
-if __name__ == "__main__":
-    app.run(debug=True)
+    col1.metric("🟢 Free Slots", free)
+    col2.metric("🔴 Occupied", occupied)
+    col3.metric("📊 Total", total)
